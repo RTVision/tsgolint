@@ -722,36 +722,62 @@ var NoUnnecessaryTypeAssertionRule = rule.Rule{
 					(ast.IsCallExpression(objectParent) && objectParent.Parent != nil && ast.IsSatisfiesExpression(objectParent.Parent)))
 		}
 
-		isAssignmentInNonStatementContext := func(node *ast.Node) bool {
-			parent := node.Parent
-			return parent != nil &&
-				ast.IsAssignmentExpression(parent, false) &&
-				parent.AsBinaryExpression().Right == node &&
-				(parent.Parent == nil || parent.Parent.Kind != ast.KindExpressionStatement)
+		// like non-null assertions (see the KindNonNullExpression listener), a
+		// type assertion on the right-hand side of an assignment narrows the
+		// flow type of the assigned variable for the code that follows, so it
+		// can be necessary even when the assignment target itself accepts the
+		// uncast type
+		isAssignmentRightHandSide := func(node *ast.Node) bool {
+			parent := parentThroughParens(node)
+			if parent == nil || !ast.IsAssignmentExpression(parent, false) {
+				return false
+			}
+			right := parent.AsBinaryExpression().Right
+			return right == node || ast.SkipParentheses(right) == node
 		}
 
-		isRightHandSideOfLogicalAssignment := func(node *ast.Node) bool {
-			parent := node.Parent
-			return parent != nil &&
-				ast.IsBinaryExpression(parent) &&
-				parent.AsBinaryExpression().Right == node &&
-				ast.IsLogicalOrCoalescingAssignmentOperator(parent.AsBinaryExpression().OperatorToken.Kind)
+		// a narrowing assertion in a variable declaration initializer narrows
+		// the variable's flow type (e.g. `let x: string | undefined = f() as
+		// string; x.length`), so removing it can break later reads
+		isNarrowingDeclarationInitializer := func(node *ast.Node, uncastType, castType *checker.Type) bool {
+			parent := parentThroughParens(node)
+			if parent == nil || !ast.IsVariableDeclaration(parent) {
+				return false
+			}
+			initializer := parent.Initializer()
+			if initializer == nil || (initializer != node && ast.SkipParentheses(initializer) != node) {
+				return false
+			}
+			constrainedCastType := castType
+			if constraint := checker.Checker_getBaseConstraintOfType(ctx.TypeChecker, castType); constraint != nil {
+				constrainedCastType = constraint
+			}
+			return !checker.Checker_isTypeAssignableTo(ctx.TypeChecker, uncastType, constrainedCastType)
 		}
 
-		isInGenericContext := func(node *ast.Node) bool {
+		// reports whether the assertion's type can feed type-parameter
+		// inference of an enclosing generic call and, if so, whether the path
+		// to that call crosses a function whose inferred return type carries
+		// the assertion's type into the inference (callback return positions)
+		isInGenericContext := func(node *ast.Node) (inGenericContext bool, throughFunctionReturn bool) {
 			seenFunction := false
+			viaReturnStatement := false
 			for current := node.Parent; current != nil; current = current.Parent {
 				if current.Kind == ast.KindFunctionDeclaration {
-					return false
+					return false, false
+				}
+				if ast.IsReturnStatement(current) {
+					viaReturnStatement = true
 				}
 				if ast.IsFunctionExpression(current) || ast.IsArrowFunction(current) {
-					if current.Body() != nil && current.Body().Kind == ast.KindBlock {
-						return false
+					if current.Body() != nil && current.Body().Kind == ast.KindBlock && !viaReturnStatement {
+						return false, false
 					}
 					if seenFunction {
-						return false
+						return false, false
 					}
 					seenFunction = true
+					viaReturnStatement = false
 				}
 				if ast.IsCallExpression(current) || ast.IsNewExpression(current) {
 					if current.TypeArguments() != nil {
@@ -764,11 +790,11 @@ var NoUnnecessaryTypeAssertionRule = rule.Rule{
 					}
 					calleeType := ctx.TypeChecker.GetTypeAtLocation(current.Expression())
 					if hasGenericCallSignature(calleeType) {
-						return true
+						return true, seenFunction
 					}
 				}
 			}
-			return false
+			return false, false
 		}
 
 		skipParentTypeForContextualAny := func(node *ast.Node) bool {
@@ -781,23 +807,33 @@ var NoUnnecessaryTypeAssertionRule = rule.Rule{
 					ast.IsSatisfiesExpression(parent))
 		}
 
-		shouldSkipContextualTypeFallback := func(node *ast.Node, castIsAny bool) bool {
+		shouldSkipContextualTypeFallback := func(node *ast.Node, castIsAny bool, uncastType, castType *checker.Type) bool {
 			parent := parentThroughParens(node)
 			if castIsAny {
-				return (parent != nil && ast.IsLogicalExpression(parent)) || isInGenericContext(node)
+				if parent != nil && ast.IsLogicalExpression(parent) {
+					return true
+				}
+				inGenericContext, _ := isInGenericContext(node)
+				return inGenericContext
 			}
 
 			if skipParentTypeForContextualAny(node) ||
 				ast.IsArrayLiteralExpression(node.Expression()) ||
 				isInDestructuringDeclaration(node) ||
 				isPropertyInProblematicContext(node) ||
-				isAssignmentInNonStatementContext(node) ||
-				isRightHandSideOfLogicalAssignment(node) ||
+				isAssignmentRightHandSide(node) ||
+				isNarrowingDeclarationInitializer(node, uncastType, castType) ||
 				isArgumentToOverloadedFunction(node) {
 				return true
 			}
 
-			if isInGenericContext(node) {
+			if inGenericContext, throughFunctionReturn := isInGenericContext(node); inGenericContext {
+				// when the assertion is (part of) the returned expression of a
+				// callback whose inferred return type instantiates the generic
+				// call's type parameters, removing it changes that inference
+				if throughFunctionReturn {
+					return true
+				}
 				originalExpr := getOriginalExpression(node)
 				return !isConceptuallyLiteral(originalExpr) &&
 					(parent == nil || !ast.IsPropertyAssignment(parent))
@@ -807,10 +843,38 @@ var NoUnnecessaryTypeAssertionRule = rule.Rule{
 		}
 
 		hasPhantomTypeArgumentMismatch := func(node *ast.Node, uncastType, contextualType *checker.Type) bool {
-			return isInGenericContext(node) &&
+			inGenericContext, _ := isInGenericContext(node)
+			return inGenericContext &&
 				(hasPhantomTypeArguments(uncastType) ||
 					hasPhantomTypeArguments(contextualType)) &&
 				!haveSameTypeArguments(uncastType, contextualType)
+		}
+
+		// a method call on an evolving array (e.g. `const xs = []; xs.push(v as
+		// T)`) has a contextual type of `any`, but the argument's type drives
+		// the array's inferred element type, so the assertion is load-bearing
+		isArgumentToEvolvingArrayMethod := func(node *ast.Node) bool {
+			parent := parentThroughParens(node)
+			if parent == nil || !ast.IsCallExpression(parent) {
+				return false
+			}
+			callee := parent.Expression()
+			if !ast.IsAccessExpression(callee) {
+				return false
+			}
+			object := ast.SkipParentheses(callee.Expression())
+			if !ast.IsIdentifier(object) {
+				return false
+			}
+			symbol := ctx.TypeChecker.GetSymbolAtLocation(object)
+			if symbol == nil || symbol.ValueDeclaration == nil || !ast.IsVariableDeclaration(symbol.ValueDeclaration) {
+				return false
+			}
+			declaration := symbol.ValueDeclaration.AsVariableDeclaration()
+			return declaration.Type == nil &&
+				declaration.Initializer != nil &&
+				ast.IsArrayLiteralExpression(declaration.Initializer) &&
+				len(declaration.Initializer.AsArrayLiteralExpression().Elements.Nodes) == 0
 		}
 
 		isNullishLiteralToUnion := func(node *ast.Node, castType *checker.Type) bool {
@@ -912,7 +976,7 @@ var NoUnnecessaryTypeAssertionRule = rule.Rule{
 
 			castIsAny := isTypeAny(castType) && !skipParentTypeForContextualAny(node)
 			var contextualType *checker.Type
-			if !shouldSkipContextualTypeFallback(node, castIsAny) {
+			if !shouldSkipContextualTypeFallback(node, castIsAny, uncastType, castType) {
 				contextualType = checker.Checker_getContextualType(ctx.TypeChecker, node, checker.ContextFlagsNone)
 			}
 
@@ -920,7 +984,7 @@ var NoUnnecessaryTypeAssertionRule = rule.Rule{
 				contextualTypeIsAny := isTypeAny(contextualType)
 				isCallArgument, _ := isArgumentToParentCallOrNew(node)
 				anyInvolvedInContextualCheck := (!contextualTypeIsAny && !containsAny(contextualType)) ||
-					(contextualTypeIsAny && isCallArgument && !containsAny(castType))
+					(contextualTypeIsAny && isCallArgument && !containsAny(castType) && !isArgumentToEvolvingArrayMethod(node))
 
 				isContextuallyUnnecessary := !typeAnnotationIsConstAssertion &&
 					!containsAny(uncastType) &&

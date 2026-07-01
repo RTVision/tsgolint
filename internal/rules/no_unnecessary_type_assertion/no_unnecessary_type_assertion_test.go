@@ -1094,6 +1094,87 @@ fn((null) as string | null);
 const value: undefined = (() => {})() as undefined;
     `,
 		},
+		{
+			// assignment RHS: assertion narrows the flow type of 'fqdn' for the
+			// following read; removing it breaks 'this.fqdn = fqdn'
+			Code: `
+declare const env: { FQDN?: string };
+class FetchAgent {
+  fqdn: string;
+  constructor(fqdn?: string) {
+    if (typeof fqdn === 'undefined') fqdn = env.FQDN as string;
+    this.fqdn = fqdn;
+  }
+}
+    `,
+		},
+		{
+			// assignment RHS inside a callback: assertion controls the flow type
+			// of the 'let'-style union parameter used afterwards
+			Code: `
+interface TableField {
+  key: string;
+  label: string;
+  sortable?: boolean;
+}
+declare function addField(field: TableField): void;
+declare const columns: (string | TableField)[];
+columns.map(column => {
+  if (typeof column === 'string') {
+    column = { key: column, label: column.toUpperCase() } as TableField;
+  }
+  addField(column);
+  return column;
+});
+    `,
+		},
+		{
+			// evolving array: the assertion determines the inferred element type
+			Code: `
+interface Link {
+  href: string;
+}
+declare const link: Link;
+const fileLinks = [];
+fileLinks.push(link as Link & { method: 'OPTIONS' });
+const links: (Link & { method: 'OPTIONS' })[] = fileLinks;
+    `,
+		},
+		{
+			// assertion is the returned expression of a callback to a generic
+			// call: it drives inference of the type parameter, which a later
+			// argument depends on (removing it breaks the 'items' argument)
+			Code: `
+interface Item {
+  id: string | number;
+}
+declare function combine<T1, T2 extends T1>(factory: () => T1, extras: readonly T2[]): T1[];
+declare const items: Item[];
+combine(() => ({ id: 0 } as Item), items);
+    `,
+		},
+		{
+			// same, but via a return statement in a block-bodied callback
+			Code: `
+interface Item {
+  id: string | number;
+}
+declare function combine<T1, T2 extends T1>(factory: () => T1, extras: readonly T2[]): T1[];
+declare const items: Item[];
+combine(() => {
+  return { id: 0 } as Item;
+}, items);
+    `,
+		},
+		{
+			// declaration initializer: narrowing assertion affects the variable's
+			// flow type; removing it breaks 'value.length'
+			Code: `
+declare function fetchValue(): string | undefined;
+let value: string | undefined = fetchValue() as string;
+value.length;
+    `,
+		},
 	}, []rule_tester.InvalidTestCase{
 		{
 			Code:   "const foo = <3>3;",
